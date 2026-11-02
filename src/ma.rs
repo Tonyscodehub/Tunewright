@@ -16,7 +16,13 @@ impl MusicAssistant {
     /// a long-lived token to remember instead of the password.
     pub fn connect(req: &ConnectRequest) -> Result<(Self, Option<String>)> {
         let base = normalise_url(&req.url);
-        let mut ws = JsonSocket::connect(&ws_url(&base, "/ws"))?;
+        let mut ws = JsonSocket::connect(&ws_url(&base, "/ws")).map_err(|e| {
+            if crate::ws::probe_kind(&base) == Some("home_assistant") {
+                format!("{base} is Home Assistant – choose \"Home Assistant\" above, or use Music Assistant's own address (usually port 8095)")
+            } else {
+                e
+            }
+        })?;
         // The server greets every new connection with its server info.
         let info = ws.recv()?;
         let schema = info.get("schema_version").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -47,7 +53,11 @@ impl MusicAssistant {
                 if req.password.is_empty() {
                     return Err("Enter your Music Assistant password".into());
                 }
-                let access = login(&base, req.username.trim(), &req.password)?;
+                let access = match me.ws_login(req.username.trim(), &req.password)? {
+                    Some(t) => t,
+                    // Servers without the WebSocket login: use the HTTP endpoint.
+                    None => login(&base, req.username.trim(), &req.password)?,
+                };
                 me.authenticate(&access)?;
                 let long_lived = me.create_long_lived_token();
                 Ok((me, long_lived))
@@ -64,6 +74,27 @@ impl MusicAssistant {
             return Err("Music Assistant rejected the token".into());
         }
         Ok(())
+    }
+
+    /// Sign in over the WebSocket. Ok(None) means the server doesn't offer it.
+    fn ws_login(&mut self, username: &str, password: &str) -> Result<Option<String>> {
+        let res = match self.cmd(
+            "auth/login",
+            json!({ "username": username, "password": password, "device_name": "Tunewright" }),
+        ) {
+            Ok(r) => r,
+            Err(e) if e.contains("Invalid command") => return Ok(None),
+            Err(e) => return Err(friendly_login_error(&e)),
+        };
+        if res.get("success").and_then(|s| s.as_bool()) == Some(false) {
+            let why = res.get("error").and_then(|e| e.as_str()).unwrap_or("");
+            return Err(friendly_login_error(why));
+        }
+        res.get("access_token")
+            .or_else(|| res.get("token"))
+            .and_then(|t| t.as_str())
+            .map(|t| Some(t.to_string()))
+            .ok_or_else(|| "Music Assistant login gave no token".to_string())
     }
 
     fn create_long_lived_token(&mut self) -> Option<String> {
@@ -112,6 +143,15 @@ impl MusicAssistant {
     }
 }
 
+fn friendly_login_error(detail: &str) -> String {
+    let d = detail.to_lowercase();
+    if d.contains("invalid") || d.contains("password") || d.contains("credential") || d.contains("authentication failed") || d.contains("login failed") || d.is_empty() {
+        "Wrong Music Assistant username or password".into()
+    } else {
+        format!("Music Assistant login failed: {detail}")
+    }
+}
+
 /// POST /auth/login. Sends both the old flat and the newer nested credential shapes.
 fn login(base: &str, username: &str, password: &str) -> Result<String> {
     let body = json!({
@@ -123,6 +163,7 @@ fn login(base: &str, username: &str, password: &str) -> Result<String> {
         .send_json(&body)
         .map_err(|e| match e {
             ureq::Error::StatusCode(401) => "Wrong username or password".to_string(),
+            ureq::Error::StatusCode(404) => format!("{base}/auth/login wasn't found – check this is Music Assistant's address (usually port 8095)"),
             other => format!("Login failed: {other}"),
         })?;
     let v: Value = resp.body_mut().read_json().map_err(|e| format!("Login failed: {e}"))?;

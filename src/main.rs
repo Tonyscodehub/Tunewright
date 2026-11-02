@@ -264,14 +264,41 @@ impl App {
 
     fn player_panel(&mut self, ui: &mut egui::Ui) {
         let Some(id) = self.selected.clone() else {
-            ui.centered_and_justified(|ui| ui.label("No players found"));
+            ui.add_space(20.0);
+            ui.label(RichText::new("No players found").size(18.0));
+            ui.label(RichText::new("Check the players are enabled and switched on in Music Assistant. The list refreshes every couple of seconds.").weak());
             return;
         };
         let Some(p) = self.players.iter().find(|p| p.id == id).cloned() else { return };
 
-        // Now playing
+        // Player picker
         ui.add_space(4.0);
-        ui.label(RichText::new(&p.name).weak());
+        let mut pick: Option<String> = None;
+        ui.horizontal(|ui| {
+            ui.label("Player");
+            egui::ComboBox::from_id_salt("player_pick")
+                .selected_text(RichText::new(&p.name).strong())
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    for other in &self.players {
+                        let state = match other.state {
+                            State::Playing => "  (playing)",
+                            State::Paused => "  (paused)",
+                            State::Off => "  (off)",
+                            State::Idle => "",
+                        };
+                        if ui.selectable_label(other.id == id, format!("{}{}", other.name, state)).clicked() {
+                            pick = Some(other.id.clone());
+                        }
+                    }
+                });
+            ui.label(RichText::new(format!("{} available", self.players.len())).weak());
+        });
+        if let Some(new_id) = pick {
+            self.select(new_id);
+            return;
+        }
+        ui.add_space(8.0);
         let title = p.title.clone().unwrap_or_else(|| "Nothing playing".into());
         ui.label(RichText::new(title).size(22.0).strong());
         let sub: Vec<String> = [p.artist.clone(), p.album.clone()].into_iter().flatten().filter(|s| !s.is_empty()).collect();
@@ -549,7 +576,7 @@ mod mock_tests {
     use super::*;
 
     fn base() -> String {
-        std::env::var("TUNEWRIGHT_MOCK").expect("set TUNEWRIGHT_MOCK")
+        format!("{}/some/page#/x", std::env::var("TUNEWRIGHT_MOCK").expect("set TUNEWRIGHT_MOCK"))
     }
     fn req(mode: Mode, auth: AuthMethod, password: &str, token: &str, saved: Option<&str>) -> ConnectRequest {
         ConnectRequest {

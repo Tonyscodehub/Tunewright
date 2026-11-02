@@ -46,7 +46,13 @@ impl HomeAssistant {
             }
         };
 
-        let mut ws = JsonSocket::connect(&ws_url(&base, "/api/websocket"))?;
+        let mut ws = JsonSocket::connect(&ws_url(&base, "/api/websocket")).map_err(|e| {
+            if crate::ws::probe_kind(&base) == Some("music_assistant") {
+                format!("{base} is Music Assistant – choose \"Music Assistant\" above, or use Home Assistant's address (usually port 8123)")
+            } else {
+                e
+            }
+        })?;
         let hello = ws.recv()?;
         let version = hello.get("ha_version").and_then(|v| v.as_str()).unwrap_or("?").to_string();
         ws.send(&json!({ "type": "auth", "access_token": access }))?;
@@ -158,7 +164,15 @@ fn refresh(base: &str, refresh_token: &str) -> Result<String> {
 /// Home Assistant's own username/password login flow. Returns (access, refresh).
 fn login_flow(base: &str, username: &str, password: &str) -> Result<(String, String)> {
     let client_id = format!("{base}/");
-    let fail = |e: ureq::Error| format!("Home Assistant login failed: {e}");
+    let fail = |e: ureq::Error| match e {
+        ureq::Error::StatusCode(404) if crate::ws::probe_kind(base) == Some("music_assistant") => format!(
+            "{base} is Music Assistant – choose \"Music Assistant\" above, or use Home Assistant's address (usually port 8123)"
+        ),
+        ureq::Error::StatusCode(404) => format!(
+            "{base} doesn't look like Home Assistant (no login page found) – check the address and port (usually 8123)"
+        ),
+        other => format!("Home Assistant login failed: {other}"),
+    };
 
     let mut r = ureq::post(&format!("{base}/auth/login_flow"))
         .send_json(json!({

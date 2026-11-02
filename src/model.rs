@@ -180,19 +180,34 @@ pub const SEARCH_GROUPS: [(&str, &str); 5] = [
     ("radio", "radio"),
 ];
 
-/// Normalise a base URL: trim, add http:// if no scheme, drop trailing slashes.
+/// Normalise a base URL to scheme://host[:port]. Anything after the host (a page path
+/// copied from the browser, "#/home", an ingress link) is dropped, because the APIs live
+/// at fixed paths from the server root.
 pub fn normalise_url(url: &str) -> String {
-    let mut u = url.trim().to_string();
-    if !u.starts_with("http://") && !u.starts_with("https://") {
-        u = format!("http://{u}");
-    }
-    while u.ends_with('/') {
-        u.pop();
-    }
-    u
+    let u = url.trim();
+    let (scheme, rest) = match u.split_once("://") {
+        Some((s, r)) => (s.to_ascii_lowercase(), r),
+        None => ("http".to_string(), u),
+    };
+    let scheme = if scheme == "https" { "https" } else { "http" };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    format!("{scheme}://{host}")
 }
 
 pub fn ws_url(base: &str, path: &str) -> String {
     let b = base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
     format!("{b}{path}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn urls() {
+        assert_eq!(normalise_url("homeassistant.local:8123/lovelace/0"), "http://homeassistant.local:8123");
+        assert_eq!(normalise_url(" http://192.168.1.5:8095/#/home "), "http://192.168.1.5:8095");
+        assert_eq!(normalise_url("HTTPS://ha.example.com/hassio/ingress/x?y=1"), "https://ha.example.com");
+        assert_eq!(normalise_url("http://10.0.0.2:8095/"), "http://10.0.0.2:8095");
+        assert_eq!(ws_url("https://a.b", "/ws"), "wss://a.b/ws");
+    }
 }

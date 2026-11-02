@@ -15,7 +15,10 @@ pub struct JsonSocket {
 
 impl JsonSocket {
     pub fn connect(url: &str) -> Result<Self> {
-        let (sock, _) = tungstenite::connect(url).map_err(|e| format!("Could not connect to {url}: {e}"))?;
+        let (sock, _) = tungstenite::connect(url).map_err(|e| match &e {
+            tungstenite::Error::Http(r) => format!("{url} answered {} – is this the right kind of server and port?", r.status()),
+            _ => format!("Could not connect to {url}: {e}"),
+        })?;
         let timeout = Some(Duration::from_secs(20));
         match sock.get_ref() {
             MaybeTlsStream::Plain(s) => {
@@ -60,5 +63,23 @@ impl JsonSocket {
 impl Drop for JsonSocket {
     fn drop(&mut self) {
         let _ = self.sock.close(None);
+    }
+}
+
+/// Work out what's actually at an address, to turn a bare 404 into useful advice.
+pub fn probe_kind(base: &str) -> Option<&'static str> {
+    // Music Assistant answers /info with its server details, no sign-in needed.
+    if let Ok(mut r) = ureq::get(&format!("{base}/info")).call() {
+        if let Ok(v) = r.body_mut().read_json::<serde_json::Value>() {
+            if v.get("server_id").is_some() && v.get("schema_version").is_some() {
+                return Some("music_assistant");
+            }
+        }
+    }
+    // Home Assistant answers /api/ with 401 when you're not signed in.
+    match ureq::get(&format!("{base}/api/")).call() {
+        Err(ureq::Error::StatusCode(401)) => Some("home_assistant"),
+        Ok(r) if r.status() == 200 => Some("home_assistant"),
+        _ => None,
     }
 }
