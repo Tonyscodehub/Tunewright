@@ -144,12 +144,13 @@ impl MusicAssistant {
 }
 
 fn friendly_login_error(detail: &str) -> String {
-    let d = detail.to_lowercase();
-    if d.contains("invalid") || d.contains("password") || d.contains("credential") || d.contains("authentication failed") || d.contains("login failed") || d.is_empty() {
-        "Wrong Music Assistant username or password".into()
-    } else {
-        format!("Music Assistant login failed: {detail}")
-    }
+    let detail = detail.trim();
+    let said = if detail.is_empty() { String::new() } else { format!(" (server said: {detail})") };
+    format!(
+        "Music Assistant didn't accept that username and password{said}. If you sign in to Music Assistant \
+         with \"Login with Home Assistant\", it has no password of its own: choose Token and paste a \
+         long-lived token from your Music Assistant profile, or connect via Home Assistant instead."
+    )
 }
 
 /// POST /auth/login. Sends both the old flat and the newer nested credential shapes.
@@ -162,9 +163,12 @@ fn login(base: &str, username: &str, password: &str) -> Result<String> {
     let mut resp = ureq::post(&format!("{base}/auth/login"))
         .send_json(&body)
         .map_err(|e| match e {
-            ureq::Error::StatusCode(401) => "Wrong username or password".to_string(),
+            ureq::Error::StatusCode(401) => friendly_login_error(""),
             ureq::Error::StatusCode(404) => format!("{base}/auth/login wasn't found – check this is Music Assistant's address (usually port 8095)"),
-            other => format!("Login failed: {other}"),
+            other => {
+                let msg = other.to_string();
+                crate::ws::explain_network(base, &msg, 8095).unwrap_or(format!("Login failed: {msg}"))
+            }
         })?;
     let v: Value = resp.body_mut().read_json().map_err(|e| format!("Login failed: {e}"))?;
     v.get("token")

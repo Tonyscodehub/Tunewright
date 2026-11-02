@@ -211,3 +211,25 @@ mod tests {
         assert_eq!(ws_url("https://a.b", "/ws"), "wss://a.b/ws");
     }
 }
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+    #[test]
+    fn refused_port_is_explained() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let req = |mode| ConnectRequest {
+            mode,
+            url: "127.0.0.1:812".into(),
+            auth: AuthMethod::Password,
+            username: "tony".into(),
+            password: "x".into(),
+            token: String::new(),
+            saved_token: None,
+        };
+        let e = crate::ha::HomeAssistant::connect(&req(Mode::HomeAssistant)).err().unwrap();
+        assert!(e.contains("Nothing answered at http://127.0.0.1:812") && e.contains("8123"), "{e}");
+        let e = crate::ma::MusicAssistant::connect(&req(Mode::MusicAssistant)).err().unwrap();
+        assert!(e.contains("Nothing answered") && e.contains("8095"), "{e}");
+    }
+}

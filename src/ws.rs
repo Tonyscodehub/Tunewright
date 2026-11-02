@@ -18,6 +18,11 @@ impl JsonSocket {
         let (sock, _) = tungstenite::connect(url).map_err(|e| match &e {
             tungstenite::Error::Http(r) => format!("{url} answered {} – is this the right kind of server and port?", r.status()),
             _ => format!("Could not connect to {url}: {e}"),
+        }).map_err(|msg| {
+            let base = url.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
+            let base = crate::model::normalise_url(&base);
+            let port = if url.contains("/api/websocket") { 8123 } else { 8095 };
+            explain_network(&base, &msg, port).unwrap_or(msg)
         })?;
         let timeout = Some(Duration::from_secs(20));
         match sock.get_ref() {
@@ -82,4 +87,21 @@ pub fn probe_kind(base: &str) -> Option<&'static str> {
         Ok(r) if r.status() == 200 => Some("home_assistant"),
         _ => None,
     }
+}
+
+/// Turn low-level connection failures into plain advice about the address.
+pub fn explain_network(base: &str, err: &str, usual_port: u16) -> Option<String> {
+    let e = err.to_lowercase();
+    if e.contains("refused") || e.contains("10061") || e.contains("os error 111") || e.contains("unable to connect") {
+        return Some(format!(
+            "Nothing answered at {base}. Check the address and port – this is usually port {usual_port}."
+        ));
+    }
+    if e.contains("timed out") || e.contains("10060") || e.contains("unreachable") || e.contains("no route") {
+        return Some(format!("Couldn't reach {base} – check the address and that you're on the same network."));
+    }
+    if e.contains("dns") || e.contains("resolve") || e.contains("11001") || e.contains("not known") {
+        return Some(format!("Couldn't find {base} – check the server name, or use its IP address."));
+    }
+    None
 }

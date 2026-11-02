@@ -161,46 +161,104 @@ fn refresh(base: &str, refresh_token: &str) -> Result<String> {
     v.get("access_token").and_then(|t| t.as_str()).map(str::to_string).ok_or_else(|| "no token".into())
 }
 
+/// Send a request and return (status, JSON body) without treating 4xx/5xx as a transport
+/// error, so Home Assistant's own message can be shown.
+fn ha_request(base: &str, req: std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<(u16, Value)> {
+    match req {
+        Ok(mut r) => {
+            let status = r.status().as_u16();
+            let body = r.body_mut().read_json::<Value>().unwrap_or(Value::Null);
+            Ok((status, body))
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            Err(crate::ws::explain_network(base, &msg, 8123).unwrap_or(format!("Home Assistant login failed: {msg}")))
+        }
+    }
+}
+
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder().http_status_as_error(false).build().into()
+}
+
+fn ha_message(body: &Value) -> String {
+    body.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string()
+}
+
 /// Home Assistant's own username/password login flow. Returns (access, refresh).
 fn login_flow(base: &str, username: &str, password: &str) -> Result<(String, String)> {
     let client_id = format!("{base}/");
-    let fail = |e: ureq::Error| match e {
-        ureq::Error::StatusCode(404) if crate::ws::probe_kind(base) == Some("music_assistant") => format!(
-            "{base} is Music Assistant – choose \"Music Assistant\" above, or use Home Assistant's address (usually port 8123)"
-        ),
-        ureq::Error::StatusCode(404) => format!(
-            "{base} doesn't look like Home Assistant (no login page found) – check the address and port (usually 8123)"
-        ),
-        other => format!("Home Assistant login failed: {other}"),
+    let a = agent();
+
+    // Ask which sign-in providers this Home Assistant offers, and use its own one.
+    let (status, providers) = ha_request(base, a.get(&format!("{base}/auth/providers")).call())?;
+    if status == 404 {
+        if crate::ws::probe_kind(base) == Some("music_assistant") {
+            return Err(format!(
+                "{base} is Music Assistant – choose \"Music Assistant\" above, or use Home Assistant's address (usually port 8123)"
+            ));
+        }
+        return Err(format!("{base} doesn't look like Home Assistant – check the address and port (usually 8123)"));
+    }
+    let list = providers.get("providers").and_then(|p| p.as_array()).cloned()
+        .or_else(|| providers.as_array().cloned())
+        .unwrap_or_default();
+    let chosen = list
+        .iter()
+        .find(|p| p.get("type").and_then(|t| t.as_str()) == Some("homeassistant"))
+        .or_else(|| list.first());
+    let handler = match chosen {
+        Some(p) => json!([p.get("type").cloned().unwrap_or(json!("homeassistant")), p.get("id").cloned().unwrap_or(Value::Null)]),
+        None => json!(["homeassistant", null]),
     };
 
-    let mut r = ureq::post(&format!("{base}/auth/login_flow"))
-        .send_json(json!({
+    let (status, flow) = ha_request(
+        base,
+        a.post(&format!("{base}/auth/login_flow")).send_json(json!({
             "client_id": client_id,
-            "handler": ["homeassistant", null],
+            "handler": handler,
             "redirect_uri": format!("{base}/?auth_callback=1"),
-        }))
-        .map_err(fail)?;
-    let flow: Value = r.body_mut().read_json().map_err(|e| e.to_string())?;
-    let flow_id = flow.get("flow_id").and_then(|f| f.as_str()).ok_or("Home Assistant did not start a login")?;
+        })),
+    )?;
+    let Some(flow_id) = flow.get("flow_id").and_then(|f| f.as_str()) else {
+        return Err(format!("Home Assistant wouldn't start a sign-in ({status}): {}", ha_message(&flow)));
+    };
 
-    let mut r = ureq::post(&format!("{base}/auth/login_flow/{flow_id}"))
-        .send_json(json!({ "username": username, "password": password, "client_id": client_id }))
-        .map_err(fail)?;
-    let step: Value = r.body_mut().read_json().map_err(|e| e.to_string())?;
-    if step.get("type").and_then(|t| t.as_str()) != Some("create_entry") {
-        if step.get("step_id").and_then(|s| s.as_str()) == Some("mfa") {
-            return Err("This account uses two-factor sign-in – use a long-lived access token instead".into());
+    let (status, step) = ha_request(
+        base,
+        a.post(&format!("{base}/auth/login_flow/{flow_id}"))
+            .send_json(json!({ "username": username, "password": password, "client_id": client_id })),
+    )?;
+    match step.get("type").and_then(|t| t.as_str()) {
+        Some("create_entry") => {}
+        Some("form") if step.get("step_id").and_then(|s| s.as_str()) == Some("mfa") => {
+            return Err("This account uses two-factor sign-in – choose Token and paste a long-lived access token instead".into())
         }
-        return Err("Wrong Home Assistant username or password".into());
+        Some("form") => {
+            let err = step.get("errors").and_then(|e| e.get("base")).and_then(|b| b.as_str()).unwrap_or("");
+            return Err(match err {
+                "invalid_auth" => "Home Assistant says the username or password is wrong. Use your Home Assistant username (not your display name).".into(),
+                "" => "Home Assistant didn't accept the sign-in".into(),
+                other => format!("Home Assistant didn't accept the sign-in ({other})"),
+            });
+        }
+        Some("abort") => {
+            let why = step.get("reason").and_then(|r| r.as_str()).unwrap_or("aborted");
+            return Err(format!("Home Assistant stopped the sign-in: {why}"));
+        }
+        _ => return Err(format!("Home Assistant sign-in failed ({status}): {}", ha_message(&step))),
     }
-    let code = step.get("result").and_then(|c| c.as_str()).ok_or("Login gave no code")?;
+    let code = step.get("result").and_then(|c| c.as_str()).ok_or("Home Assistant gave no sign-in code")?;
 
-    let mut r = ureq::post(&format!("{base}/auth/token"))
-        .send_form([("grant_type", "authorization_code"), ("code", code), ("client_id", client_id.as_str())])
-        .map_err(fail)?;
-    let tok: Value = r.body_mut().read_json().map_err(|e| e.to_string())?;
-    let access = tok.get("access_token").and_then(|t| t.as_str()).ok_or("No access token")?;
+    let (status, tok) = ha_request(
+        base,
+        a.post(&format!("{base}/auth/token"))
+            .send_form([("grant_type", "authorization_code"), ("code", code), ("client_id", client_id.as_str())]),
+    )?;
+    let access = tok.get("access_token").and_then(|t| t.as_str()).ok_or_else(|| {
+        let why = tok.get("error_description").or_else(|| tok.get("error")).and_then(|e| e.as_str()).unwrap_or("");
+        format!("Home Assistant didn't issue a token ({status}) {why}")
+    })?;
     let refresh = tok.get("refresh_token").and_then(|t| t.as_str()).unwrap_or_default();
     Ok((access.to_string(), refresh.to_string()))
 }
