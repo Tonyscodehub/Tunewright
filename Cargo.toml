@@ -1,0 +1,31 @@
+[package]
+name = "tunewright"
+version = "0.1.0"
+edition = "2021"
+description = "A small remote control for Music Assistant, directly or through Home Assistant"
+authors = ["Tony Johncock"]
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "glow",
+    "links",
+    "wayland",
+    "x11",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots", "url"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+ureq = { version = "3", features = ["json"] }
+dirs = "6"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
