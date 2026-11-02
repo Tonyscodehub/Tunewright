@@ -185,12 +185,13 @@ fn ha_message(body: &Value) -> String {
     body.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string()
 }
 
-/// Home Assistant's own username/password login flow. Returns (access, refresh).
+/// Home Assistant's own sign-in. Works through the providers Home Assistant offers
+/// (password, trusted networks, ...) and answers whichever form each one asks for.
+/// Returns (access, refresh).
 fn login_flow(base: &str, username: &str, password: &str) -> Result<(String, String)> {
     let client_id = format!("{base}/");
     let a = agent();
 
-    // Ask which sign-in providers this Home Assistant offers, and use its own one.
     let (status, providers) = ha_request(base, a.get(&format!("{base}/auth/providers")).call())?;
     if status == 404 {
         if crate::ws::probe_kind(base) == Some("music_assistant") {
@@ -200,60 +201,111 @@ fn login_flow(base: &str, username: &str, password: &str) -> Result<(String, Str
         }
         return Err(format!("{base} doesn't look like Home Assistant – check the address and port (usually 8123)"));
     }
-    let list = providers.get("providers").and_then(|p| p.as_array()).cloned()
+    let mut list = providers
+        .get("providers")
+        .and_then(|p| p.as_array())
+        .cloned()
         .or_else(|| providers.as_array().cloned())
         .unwrap_or_default();
-    let chosen = list
-        .iter()
-        .find(|p| p.get("type").and_then(|t| t.as_str()) == Some("homeassistant"))
-        .or_else(|| list.first());
-    let handler = match chosen {
-        Some(p) => json!([p.get("type").cloned().unwrap_or(json!("homeassistant")), p.get("id").cloned().unwrap_or(Value::Null)]),
-        None => json!(["homeassistant", null]),
-    };
-
-    let (status, flow) = ha_request(
-        base,
-        a.post(&format!("{base}/auth/login_flow")).send_json(json!({
-            "client_id": client_id,
-            "handler": handler,
-            "redirect_uri": format!("{base}/?auth_callback=1"),
-        })),
-    )?;
-    let Some(flow_id) = flow.get("flow_id").and_then(|f| f.as_str()) else {
-        return Err(format!("Home Assistant wouldn't start a sign-in ({status}): {}", ha_message(&flow)));
-    };
-
-    let (status, step) = ha_request(
-        base,
-        a.post(&format!("{base}/auth/login_flow/{flow_id}"))
-            .send_json(json!({ "username": username, "password": password, "client_id": client_id })),
-    )?;
-    match step.get("type").and_then(|t| t.as_str()) {
-        Some("create_entry") => {}
-        Some("form") if step.get("step_id").and_then(|s| s.as_str()) == Some("mfa") => {
-            return Err("This account uses two-factor sign-in – choose Token and paste a long-lived access token instead".into())
-        }
-        Some("form") => {
-            let err = step.get("errors").and_then(|e| e.get("base")).and_then(|b| b.as_str()).unwrap_or("");
-            return Err(match err {
-                "invalid_auth" => "Home Assistant says the username or password is wrong. Use your Home Assistant username (not your display name).".into(),
-                "" => "Home Assistant didn't accept the sign-in".into(),
-                other => format!("Home Assistant didn't accept the sign-in ({other})"),
-            });
-        }
-        Some("abort") => {
-            let why = step.get("reason").and_then(|r| r.as_str()).unwrap_or("aborted");
-            return Err(format!("Home Assistant stopped the sign-in: {why}"));
-        }
-        _ => return Err(format!("Home Assistant sign-in failed ({status}): {}", ha_message(&step))),
+    if list.is_empty() {
+        list.push(json!({ "type": "homeassistant", "id": null }));
     }
-    let code = step.get("result").and_then(|c| c.as_str()).ok_or("Home Assistant gave no sign-in code")?;
+    // Password provider first, then the rest in Home Assistant's order.
+    list.sort_by_key(|p| p.get("type").and_then(|t| t.as_str()) != Some("homeassistant"));
 
+    let mut problems: Vec<String> = Vec::new();
+    for prov in &list {
+        let kind = prov.get("type").and_then(|t| t.as_str()).unwrap_or("?").to_string();
+        let handler = json!([prov.get("type").cloned().unwrap_or(Value::Null), prov.get("id").cloned().unwrap_or(Value::Null)]);
+        let (status, mut step) = ha_request(
+            base,
+            a.post(&format!("{base}/auth/login_flow")).send_json(json!({
+                "client_id": client_id,
+                "handler": handler,
+                "redirect_uri": format!("{base}/?auth_callback=1"),
+            })),
+        )?;
+        let Some(flow_id) = step.get("flow_id").and_then(|f| f.as_str()).map(str::to_string) else {
+            problems.push(format!("{kind}: couldn't start ({status} {})", ha_message(&step)));
+            continue;
+        };
+
+        // Answer up to a few form steps (password form, user picker).
+        for _ in 0..3 {
+            match step.get("type").and_then(|t| t.as_str()) {
+                Some("create_entry") => break,
+                Some("abort") => break,
+                Some("form") => {}
+                _ => break,
+            }
+            let step_id = step.get("step_id").and_then(|s| s.as_str()).unwrap_or("");
+            if step_id == "mfa" || step_id == "select_mfa_module" {
+                return Err("This account uses two-factor sign-in – choose Token and paste a long-lived access token instead".into());
+            }
+            if step.get("errors").and_then(|e| e.get("base")).and_then(|b| b.as_str()) == Some("invalid_auth") {
+                break;
+            }
+            let fields: Vec<Value> = step.get("data_schema").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+            let names: Vec<&str> = fields.iter().filter_map(|f| f.get("name")?.as_str()).collect();
+            let answer = if names.contains(&"username") && names.contains(&"password") {
+                json!({ "username": username, "password": password, "client_id": client_id })
+            } else if names == ["user"] {
+                // Trusted networks: pick the user whose name matches.
+                let opts = fields[0].get("options").and_then(|o| o.as_array()).cloned().unwrap_or_default();
+                let wanted = username.to_lowercase();
+                let found = opts.iter().find_map(|o| {
+                    let id = o.get(0)?.as_str()?;
+                    let name = o.get(1)?.as_str()?;
+                    (name.to_lowercase() == wanted).then(|| id.to_string())
+                });
+                match found {
+                    Some(id) => json!({ "user": id, "client_id": client_id }),
+                    None => {
+                        problems.push(format!("{kind}: no user named \"{username}\""));
+                        break;
+                    }
+                }
+            } else {
+                problems.push(format!("{kind}: asks for {}", names.join(", ")));
+                break;
+            };
+            let (st, next) = ha_request(base, a.post(&format!("{base}/auth/login_flow/{flow_id}")).send_json(answer))?;
+            if next.get("type").is_none() {
+                problems.push(format!("{kind}: {} ({st})", ha_message(&next)));
+                step = Value::Null;
+                break;
+            }
+            step = next;
+        }
+
+        match step.get("type").and_then(|t| t.as_str()) {
+            Some("create_entry") => {
+                let code = step.get("result").and_then(|c| c.as_str()).ok_or("Home Assistant gave no sign-in code")?;
+                return exchange_code(&a, base, &client_id, code);
+            }
+            Some("form") if step.get("errors").and_then(|e| e.get("base")).and_then(|b| b.as_str()) == Some("invalid_auth") => {
+                problems.push(format!("{kind}: wrong username or password"));
+            }
+            Some("abort") => {
+                problems.push(format!("{kind}: {}", step.get("reason").and_then(|r| r.as_str()).unwrap_or("stopped")));
+            }
+            _ => {}
+        }
+        // Tidy up the unfinished flow; ignore failures.
+        let _ = a.delete(&format!("{base}/auth/login_flow/{flow_id}")).call();
+    }
+
+    if problems.iter().any(|p| p.ends_with("wrong username or password")) {
+        return Err("Home Assistant says the username or password is wrong. Use your Home Assistant username (shown under your profile), not your display name.".into());
+    }
+    Err(format!("Home Assistant sign-in didn't work: {}", problems.join("; ")))
+}
+
+fn exchange_code(a: &ureq::Agent, base: &str, client_id: &str, code: &str) -> Result<(String, String)> {
     let (status, tok) = ha_request(
         base,
         a.post(&format!("{base}/auth/token"))
-            .send_form([("grant_type", "authorization_code"), ("code", code), ("client_id", client_id.as_str())]),
+            .send_form([("grant_type", "authorization_code"), ("code", code), ("client_id", client_id)]),
     )?;
     let access = tok.get("access_token").and_then(|t| t.as_str()).ok_or_else(|| {
         let why = tok.get("error_description").or_else(|| tok.get("error")).and_then(|e| e.as_str()).unwrap_or("");

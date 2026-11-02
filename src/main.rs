@@ -645,5 +645,13 @@ mod mock_tests {
         ha::HomeAssistant::connect(&req(Mode::HomeAssistant, AuthMethod::Password, "", "", Some("REFR"))).unwrap();
         assert!(ha::HomeAssistant::connect(&req(Mode::HomeAssistant, AuthMethod::Token, "", "WRONG", None)).is_err());
         ha::HomeAssistant::connect(&req(Mode::HomeAssistant, AuthMethod::Token, "", "LLAT", None)).unwrap();
+        // Trusted networks: a matching user signs in without a password.
+        let mut r = req(Mode::HomeAssistant, AuthMethod::Password, "", "", None);
+        r.username = "amy".into();
+        r.password = "anything".into();
+        ha::HomeAssistant::connect(&r).unwrap();
+        // Wrong password and no trusted match gives the plain message.
+        let e = ha::HomeAssistant::connect(&req(Mode::HomeAssistant, AuthMethod::Password, "bad", "", None)).err().unwrap();
+        assert!(e.contains("username or password is wrong"), "{e}");
     }
 }
