@@ -12,8 +12,10 @@ use crate::ws::JsonSocket;
 pub struct HomeAssistant {
     ws: JsonSocket,
     next_id: u64,
-    /// Music Assistant entities. Empty means "not found, show every media player".
+    /// Music Assistant player entities.
     ma_entities: HashSet<String>,
+    /// False when the Music Assistant integration wasn't found: show every media player.
+    integration_found: bool,
     config_entry_id: Option<String>,
     pub server_label: String,
 }
@@ -66,6 +68,7 @@ impl HomeAssistant {
             ws,
             next_id: 1,
             ma_entities: HashSet::new(),
+            integration_found: false,
             config_entry_id: None,
             server_label: format!("Home Assistant {version}"),
         };
@@ -84,11 +87,23 @@ impl HomeAssistant {
                 if !id.starts_with("media_player.") {
                     continue;
                 }
-                self.ma_entities.insert(id.to_string());
+                self.integration_found = true;
                 if self.config_entry_id.is_none() {
                     self.config_entry_id =
                         e.get("config_entry_id").and_then(|c| c.as_str()).map(str::to_string);
                 }
+                // Dashboard displays (screens that can show Music Assistant's party or
+                // now-playing dashboard) are named after the screen but aren't players.
+                let unique = e.get("unique_id").and_then(|u| u.as_str()).unwrap_or("");
+                if unique.starts_with("dashboard:") {
+                    continue;
+                }
+                // Respect entities disabled or hidden in Home Assistant.
+                let set = |k: &str| e.get(k).is_some_and(|v| !v.is_null());
+                if set("disabled_by") || set("hidden_by") {
+                    continue;
+                }
+                self.ma_entities.insert(id.to_string());
             }
         }
         if self.config_entry_id.is_none() {
@@ -324,7 +339,7 @@ impl Backend for HomeAssistant {
             if !id.starts_with("media_player.") {
                 continue;
             }
-            if !self.ma_entities.is_empty() && !self.ma_entities.contains(id) {
+            if self.integration_found && !self.ma_entities.contains(id) {
                 continue;
             }
             let state_str = s.get("state").and_then(|x| x.as_str()).unwrap_or("");
