@@ -30,6 +30,8 @@ enum Conn {
 
 struct App {
     cfg: Config,
+    /// Frames drawn so far, used to apply the window level once the window is shown.
+    frames: u32,
     password: String,
     conn: Conn,
     show_settings: bool,
@@ -58,6 +60,7 @@ impl App {
         let mut app = Self {
             selected: cfg.last_player.clone(),
             password: String::new(),
+            frames: 0,
             conn: Conn::Disconnected,
             show_settings: true,
             message: None,
@@ -467,6 +470,15 @@ fn group_title(t: &str) -> &str {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Some window managers ignore the level set at creation, so apply it again
+        // once the window is actually on screen.
+        if self.frames < 3 {
+            self.frames += 1;
+            if self.frames == 3 && self.cfg.always_on_top {
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+            }
+            ctx.request_repaint();
+        }
         self.pump_events();
         if let Some((_, _, when)) = &self.message {
             if when.elapsed() > Duration::from_secs(8) {
@@ -501,6 +513,19 @@ impl eframe::App for App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !self.show_settings && ui.button("Connection").clicked() {
                         self.show_settings = true;
+                    }
+                    if ui
+                        .checkbox(&mut self.cfg.always_on_top, "Always on top")
+                        .on_hover_text("Keep Tunewright in front of other windows")
+                        .changed()
+                    {
+                        let level = if self.cfg.always_on_top {
+                            egui::WindowLevel::AlwaysOnTop
+                        } else {
+                            egui::WindowLevel::Normal
+                        };
+                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                        self.cfg.save();
                     }
                 });
             });
@@ -560,11 +585,13 @@ impl eframe::App for App {
 
 fn main() -> eframe::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let level = if Config::load().always_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Tunewright")
             .with_inner_size([760.0, 560.0])
-            .with_min_inner_size([520.0, 380.0]),
+            .with_min_inner_size([520.0, 380.0])
+            .with_window_level(level),
         ..Default::default()
     };
     eframe::run_native("Tunewright", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))

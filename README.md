@@ -23,6 +23,7 @@ Settings are saved in `%APPDATA%\Tunewright\config.json`. Untick "Remember me" t
 - Pick a player on the left. Whatever's playing is selected first.
 - The drop-down beside Search sets what the play button on a result does: play now, replace the queue, play next, or add to the end.
 - If the connection drops, Tunewright reconnects on its own.
+- Tick "Always on top" in the top bar to keep the window in front of everything else. It stays set next time.
 
 ## Building
 

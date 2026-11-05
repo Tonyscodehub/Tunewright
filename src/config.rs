@@ -22,6 +22,8 @@ pub struct Config {
     pub saved_token_for: String,
     pub remember: bool,
     pub last_player: Option<String>,
+    /// Keep the window above other windows.
+    pub always_on_top: bool,
 }
 
 impl Config {
